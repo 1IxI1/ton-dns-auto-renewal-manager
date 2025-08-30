@@ -3,6 +3,7 @@ import { mnemonicToPrivateKey, sign } from '@ton/crypto';
 import { Address, Cell, toNano, SendMode, OutAction, StateInit, storeStateInit, contractAddress, fromNano, Dictionary, loadMessage } from '@ton/core';
 import * as readline from 'readline';
 import { storeWalletActions, WalletActions, ExtensionAdd, ExtensionRemove } from './wallet-v5-test';
+import { storeOutList } from '@ton/core';
 
 // Auto-renewal configuration
 const BACKUP_DAYS = 7; // fixed backup days
@@ -27,6 +28,8 @@ const CRON_CODE_HASH = CRON_CODE.hash().toString('base64');
 const DNS_ITEM_CODE_HASH = NETWORK == 'testnet' ? "Pwq5JTFwyGqu6/6rst4LwtNbTIVKmOo33Czf/ej06BE=" : "i1/8nr/TkGTY1fVuRlnIJrt1k5I/XKSHKL5NYK9vUfk=";
 const DNS_COLLECTION_ADDRESS = NETWORK == 'testnet' ? "kQDjPtM6QusgMgWfl9kMcG-EALslbTITnKcH8VZK1pnH3f3K" : "EQC3dNlesgVD8YbAazcauIrXBPfiVhMMr5YYk2in0Mtsz0Bz";
 
+const TOPUPPER_ADDRESS = Address.parse('0:678ebe29af20f72b404adbd8d87d12cb11f391df8f488601ade336b430f13960');
+
 // all of that is upper estimate
 function calcCronStorageFee(n: number): bigint {
     return toNano(0.005) + toNano(0.0005) * BigInt(n);
@@ -36,7 +39,7 @@ function calcCronComputeFee(n: number): bigint {
     return toNano(0.005) + toNano(0.0003) * BigInt(n);
 }
 function calcW5ComputeFee(n: number): bigint {
-    return toNano(0.003) + toNano(0.0006) * BigInt(n);
+    return toNano(0.005) + toNano(0.0003) * BigInt(n);
 }
 function calcCronFwdFee(n: number): bigint {
     return toNano(0.002) + toNano(0.0004) * BigInt(n);
@@ -52,6 +55,12 @@ function calcRenewMsgsAmount(n: number): bigint {
 }
 function calcCronCostPerYEAR(n: number): bigint {
     return calcCronStorageFee(n) + calcCronComputeFee(n) + calcW5ComputeFee(n) + calcFwdFees(n) + calcRenewMsgsAmount(n) + CRON_REWARD_AMOUNT;
+}
+function calcCronInfinityModeBalance(n: number): bigint {
+    // cost for one execution cycle in infinity mode - only what's needed on cron side
+    // 2 of fwd fee and storage fee because of TopUpper call
+    const walletCallAmount = calcW5ComputeFee(n);
+    return ((calcCronStorageFee(n) + calcCronFwdFee(n)) * 2n) + calcCronComputeFee(n) + CRON_REWARD_AMOUNT + walletCallAmount;
 }
 function calcCronW5CallMsgValue(n: number): bigint {
     // msg value for `cron -> w5` calls
@@ -75,6 +84,7 @@ interface CronContract {
     balance: bigint;
     createdAt: number; // salt is timestamp
     repeatEvery: number;
+    infinityMode: boolean; // true if self-funding mode
 }
 
 // Sleep function for rate limiting
@@ -381,7 +391,8 @@ function createCronContract(
     reward: bigint,
     years: number,
     id: number = 777,
-    nextCallTime: number = 0
+    nextCallTime: number = 0,
+    infinityMode: boolean = false
 ): { address: Address; stateInit: StateInit; deployBody: Cell, deployMsgAmount: bigint } {
     // create domain renewal actions
     const renewalMessages: OutAction[] = domainAddresses.map(domainAddr => 
@@ -407,47 +418,139 @@ function createCronContract(
         };
     });
 
-    // create request message to wallet with actions
-    const requestMessageBody = beginCell()
-        .storeUint(0x6578746E, 32) // extension_action_request op
-        .storeUint(0, 64) // query_id
-        .store(storeWalletActions({ // out actions + extended actions
-            wallet: renewalMessages,
-            extended: []
-        }))
-        .endCell();
+    const cronCost = infinityMode ? calcCronInfinityModeBalance(domainAddresses.length) : calcCronCostPerYEAR(domainAddresses.length) * BigInt(years);
+    const cronW5CallMsgValue = infinityMode ? calcW5ComputeFee(domainAddresses.length) : calcCronW5CallMsgValue(domainAddresses.length);
+    const deployMsgAmount = cronCost + CRON_INIT_FEE; // no bad of additional 0.1 TON in infinity mode
 
-    const cronCost = calcCronCostPerYEAR(domainAddresses.length) * BigInt(years);
-    const cronW5CallMsgValue = calcCronW5CallMsgValue(domainAddresses.length);
-    const deployMsgAmount = cronCost + CRON_INIT_FEE;
+    let walletMessages = renewalMessages;
+    let finalRequestMessageBody: Cell;
+    let finalMsgToWallet: Cell;
+    let address: Address;
+    let stateInit: StateInit;
 
-    const msgToWallet = beginCell()
-        .storeUint(0x10, 6) // non bouncable
-        .storeAddress(walletAddress)
-        .storeCoins(cronW5CallMsgValue)
-        .storeUint(1, 1 + 4 + 4 + 64 + 32 + 1 + 1)
-        .storeRef(requestMessageBody)
-        .endCell();
+    if (infinityMode) {
+        // For infinity mode, use TopUpper to resolve chicken-and-egg problem
 
-    let data = beginCell()
-        .storeUint(0, 1) // not initialized
-        .storeUint(nextCallTime, 32) // next execution
-        .storeUint(period, 32) // repeat every
-        .storeUint(id, 32) // salt (creation timestamp)
-        .storeCoins(reward)
-        .storeAddress(walletAddress)
-        .storeRef(msgToWallet)
-        .storeUint(0, 256) // init state hash
-        .storeUint(0, 10) // init state depth
-        .endCell();
+        // Create renewal actions cell (just domain renewals)
+        const renewalActionsCell = beginCell()
+            .store(storeOutList(renewalMessages))
+            .endCell();
 
-    const stateInit : StateInit = {
-        code: CRON_CODE,
-        data: data
+        // Create CalcAndTopup message for TopUpper
+        const topupAmount = calcCronInfinityModeBalance(domainAddresses.length);
+        const calcAndTopupMessage = beginCell()
+            .storeUint(0x56f6110e, 32) // CalcAndTopup opcode
+            .storeUint(nextCallTime, 32) // firstCallTime
+            .storeUint(period, 32) // repeatEvery  
+            .storeUint(id, 32) // salt
+            .storeCoins(reward) // reward
+            .storeAddress(walletAddress) // ownerAddress
+            .storeRef(renewalActionsCell) // renewalActionsCell
+            .storeCoins(topupAmount) // topupAmount
+            .storeCoins(cronW5CallMsgValue) // msgToWalletAmount
+            .endCell();
+
+        // Create message to TopUpper
+        const topUpperMessage: OutAction = {
+            type: 'sendMsg',
+            mode: SendMode.PAY_GAS_SEPARATELY + SendMode.IGNORE_ERRORS,
+            outMsg: {
+                info: {
+                    type: 'internal',
+                    dest: TOPUPPER_ADDRESS,
+                    value: { coins: topupAmount },
+                    bounce: true,
+                    ihrDisabled: true,
+                    bounced: false,
+                    ihrFee: BigInt(0),
+                    forwardFee: BigInt(0),
+                    createdLt: BigInt(0),
+                    createdAt: 0
+                },
+                body: calcAndTopupMessage
+            }
+        };
+
+        // Add TopUpper message STRICTLY AT THE END (will be in first ref)
+        walletMessages = [...renewalMessages, topUpperMessage];
+
+        // Create final request message
+        finalRequestMessageBody = beginCell()
+            .storeUint(0x6578746E, 32) // extension_action_request op
+            .storeUint(0, 64) // query_id
+            .store(storeWalletActions({ // out actions + extended actions
+                wallet: walletMessages,
+                extended: []
+            }))
+            .endCell();
+
+        // Make it a full msg
+        finalMsgToWallet = beginCell()
+            .storeUint(0x10, 6) // non bouncable
+            .storeAddress(walletAddress)
+            .storeCoins(cronW5CallMsgValue)
+            .storeUint(1, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .storeRef(finalRequestMessageBody)
+            .endCell();
+        
+        // Create cron contract data and calculate address
+        let data = beginCell()
+            .storeUint(0, 1) // not initialized
+            .storeUint(nextCallTime, 32) // next execution
+            .storeUint(period, 32) // repeat every
+            .storeUint(id, 32) // salt (creation timestamp)
+            .storeCoins(reward)
+            .storeAddress(walletAddress)
+            .storeRef(finalMsgToWallet)
+            .storeUint(0, 256) // init state hash
+            .storeUint(0, 10) // init state depth
+            .endCell();
+
+        stateInit = {
+            code: CRON_CODE,
+            data: data
+        };
+        address = contractAddress(0, stateInit);
+
+    } else {
+        // Classic mode - original logic
+        finalRequestMessageBody = beginCell()
+            .storeUint(0x6578746E, 32) // extension_action_request op
+            .storeUint(0, 64) // query_id
+            .store(storeWalletActions({ // out actions + extended actions
+                wallet: walletMessages,
+                extended: []
+            }))
+            .endCell();
+
+        finalMsgToWallet = beginCell()
+            .storeUint(0x10, 6) // non bouncable
+            .storeAddress(walletAddress)
+            .storeCoins(cronW5CallMsgValue)
+            .storeUint(1, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .storeRef(finalRequestMessageBody)
+            .endCell();
+
+        let data = beginCell()
+            .storeUint(0, 1) // not initialized
+            .storeUint(nextCallTime, 32) // next execution
+            .storeUint(period, 32) // repeat every
+            .storeUint(id, 32) // salt (creation timestamp)
+            .storeCoins(reward)
+            .storeAddress(walletAddress)
+            .storeRef(finalMsgToWallet)
+            .storeUint(0, 256) // init state hash
+            .storeUint(0, 10) // init state depth
+            .endCell();
+
+        stateInit = {
+            code: CRON_CODE,
+            data: data
+        };
+        address = contractAddress(0, stateInit);
     }
-    const address = contractAddress(0, stateInit);
 
-    // deploy body with opcode from cron-ui  
+    // deploy body with opcode from cron-ui
     const deployBody = beginCell()
         .storeUint(0x2e41d3ac, 32) // deploy opcode
         .endCell();
@@ -670,6 +773,8 @@ async function getCronContracts(walletAddress: Address): Promise<CronContract[]>
                 if (cronData && cronData.initialized) {
                     // Parse the message to count domains
                     const domains = parseDomainsFromCronMessage(cronData.message);
+                    // Check if it's infinity mode by looking for self-funding message
+                    const infinityMode = checkInfinityModeFromCronMessage(cronData.message, address);
                     
                     cronContracts.push({
                         address,
@@ -680,7 +785,8 @@ async function getCronContracts(walletAddress: Address): Promise<CronContract[]>
                         initialized: cronData.initialized,
                         balance: BigInt(account.balance || 0),
                         createdAt: cronData.salt,
-                        repeatEvery: cronData.repeatEvery
+                        repeatEvery: cronData.repeatEvery,
+                        infinityMode
                     });
                 }
             }
@@ -727,8 +833,9 @@ async function getCronAccountStates(addresses: string[]): Promise<Map<string, an
 function parseDomainsFromCronMessage(message: Cell): Address[] {
     try {
         let domains: Address[] = []
+        let domainsSet = new Set<string>()
         let i = 0
-        function parseRefs(message: Cell) { 
+        const parseRefs = (message: Cell) => { 
             message.refs.forEach(ref => {
                 // console.log("Processing ref #" + i)
                 i++
@@ -736,7 +843,14 @@ function parseDomainsFromCronMessage(message: Cell): Address[] {
                 try {
                     // const m = loadMessage(s)
                     if (s.loadUint(6) == 0x18) {
-                        domains.push(s.loadAddress())
+                        const destAddress = s.loadAddress();
+                        // Skip TopUpper address - it's not a domain
+                        if (!destAddress.equals(TOPUPPER_ADDRESS)) {
+                            if (!domainsSet.has(destAddress.toString())) {
+                                domains.push(destAddress);
+                                domainsSet.add(destAddress.toString());
+                            }
+                        }
                     }
                 } catch {}
 
@@ -748,6 +862,36 @@ function parseDomainsFromCronMessage(message: Cell): Address[] {
     } catch (error) {
         console.warn('Failed to parse domains from CRON message:', error);
         return [];
+    }
+}
+
+function checkInfinityModeFromCronMessage(message: Cell, cronAddress: Address): boolean {
+    try {
+        let foundTopUpperMessage = false;
+        let i = 0;
+        const parseRefs = (message: Cell) => { 
+            message.refs.forEach(ref => {
+                // console.log("Processing ref #" + i)
+                i++
+                const s = ref.beginParse()
+                try {
+                    // check if this is a message to TopUpper address
+                    if (s.loadUint(6) == 0x18) {
+                        const destAddress = s.loadAddress();
+                        if (destAddress.equals(TOPUPPER_ADDRESS)) {
+                            foundTopUpperMessage = true;
+                        }
+                    }
+                } catch {}
+
+                parseRefs(ref)
+            })
+        }
+        parseRefs(message)
+        return foundTopUpperMessage;
+    } catch (error) {
+        console.warn('Failed to check infinity mode from CRON message:', error);
+        return false;
     }
 }
 
@@ -850,13 +994,15 @@ async function redeployCronContract(
     salt: number,
     nextCallTime: number,
     period: number,
-    redeployAmount: bigint
+    redeployAmount: bigint,
+    infinityMode: boolean = false
 ): Promise<void> {
     if (!appState) throw new Error('App not initialized');
     
     // Create new CRON contract with same parameters
     const domainAddresses = selectedDomains.map(d => d.address);
-    const newCron = createCronContract(appState.wallet.address, domainAddresses, period, CRON_REWARD_AMOUNT, 1, salt, nextCallTime);
+    const years = infinityMode ? 0 : 1; // for infinity mode, use 0, otherwise 1 for compat
+    const newCron = createCronContract(appState.wallet.address, domainAddresses, period, CRON_REWARD_AMOUNT, years, salt, nextCallTime, infinityMode);
     
     console.log(`📍 New CRON address: ${newCron.address.toString()}`);
     
@@ -1024,11 +1170,15 @@ async function deployAutoRenewalWithParams(
     deployAmount?: bigint,
     customSalt?: number,
     customNextCallTime?: number,
-    customPeriod?: number
+    customPeriod?: number,
+    years: number = 1,
+    infinityMode: boolean = false
 ): Promise<void> {
     if (!appState) throw new Error('App not initialized');
         
         // Calculate period and first renewal date
+        customPeriod = 100; // DEBUG
+        customNextCallTime = 0; // DEBUG
         const period = customPeriod ?? (SECONDS_IN_YEAR - BACKUP_DAYS * SECONDS_IN_DAY);
         const earliestExpiration = selectedDomains.reduce((earliest, domain) => {
             return domain.expirationDate < earliest ? domain.expirationDate : earliest;
@@ -1054,7 +1204,7 @@ async function deployAutoRenewalWithParams(
         const domainAddresses = selectedDomains.map(d => d.address);
         
         console.log('\n🏗️  Creating CRON contract...');
-        const cron = createCronContract(appState.wallet.address, domainAddresses, period, CRON_REWARD_AMOUNT, 1, salt, nextCallTime);
+        const cron = createCronContract(appState.wallet.address, domainAddresses, period, CRON_REWARD_AMOUNT, years, salt, nextCallTime, infinityMode);
         
         console.log(`📍 CRON address: ${cron.address.toString()}`);
     
@@ -1129,9 +1279,13 @@ async function deployAutoRenewalWithParams(
             console.log('');
             console.log('📊 Summary:');
             console.log(`   CRON address: ${cron.address.toString()}`);
+            console.log(`   Mode: ${infinityMode ? 'Infinity' : 'Classic'}`);
             console.log(`   Domains: ${selectedDomains.length}`);
             console.log(`   First renewal: ${firstRenewalDate.toLocaleDateString()}`);
             console.log(`   Period: ${months} months ${days} days`);
+            if (!infinityMode) {
+                console.log(`   Years funded: ${years}`);
+            }
             console.log('');
             console.log('⏳ Please wait 10-20 seconds for transaction confirmation');
         console.log(`🔍 Check status: https://testnet.tonscan.org/address/${appState.wallet.address.toString()}`);
@@ -1240,17 +1394,34 @@ async function showCronContracts(): Promise<void> {
         const nextCall = new Date(cron.nextCallTime * 1000);
         const createdAt = new Date(cron.createdAt * 1000);
         
-        // Calculate remaining years
-        const yearCost = calcCronCostPerYEAR(cron.domainsCount);
-        const remainingYears = yearCost > 0 ? Math.floor(Number(cron.balance) / Number(yearCost)) : 0;
+        // Calculate remaining years based on mode
+        let remainingYears = 0;
+        let isActive = false;
+        let status = '';
+        
+        if (cron.infinityMode) {
+            // For infinity mode, check if there's enough balance for at least one cycle
+            const oneCycleCost = calcCronInfinityModeBalance(cron.domainsCount);
+            isActive = cron.balance >= oneCycleCost;
+            status = isActive ? '♾️  Active (Infinity)' : '❌ Broken (Infinity)';
+        } else {
+            // For classic mode, calculate remaining years
+            const yearCost = calcCronCostPerYEAR(cron.domainsCount);
+            remainingYears = yearCost > 0 ? Math.floor(Number(cron.balance) / Number(yearCost)) : 0;
+            isActive = remainingYears > 0;
+            status = isActive ? '✅ Active (Classic)' : '❌ Exhausted';
+        }
 
-        const isActive = remainingYears > 0;
-        const status = isActive ? '✅ Active' : '❌ Exhausted';
+        const mode = cron.infinityMode ? 'Infinity' : 'Classic';
+        const balanceDisplay = cron.infinityMode 
+            ? `${fromNano(cron.balance)} TON` 
+            : `${fromNano(cron.balance)} TON (~${remainingYears} years remaining)`;
 
         console.log(`${index + 1}. CRON Contract ${status}`);
         console.log(`   Address: ${cron.address.toString()}`);
         console.log(`   Created: ${createdAt.toLocaleString()}`);
-        console.log(`   Balance: ${fromNano(cron.balance)} TON (~${remainingYears} years remaining)`);
+        console.log(`   Mode: ${mode}`);
+        console.log(`   Balance: ${balanceDisplay}`);
         console.log(`   Reward: ${fromNano(cron.reward)} TON`);
         console.log(`   Domains: ~${cron.domainsCount} domains`);
         console.log(`   Next execution: ${nextCall.toLocaleString()}`);
@@ -1318,9 +1489,39 @@ async function createAutoRenewal(): Promise<void> {
             console.log(`   - ${domain.name}`);
         });
     
-    // Calculate costs
-    const totalCost = calcCronCostPerYEAR(selectedDomains.length);
-    console.log(`\n💰 Estimated cost for 1 year: ${fromNano(totalCost)} TON`);
+    // Ask for number of years
+    const yearsInput = await question('\n⏰ Enter number of years to fund (0 for Infinity mode): ');
+    const years = parseInt(yearsInput.trim());
+    
+    if (isNaN(years) || years < 0) {
+        console.log('❌ Invalid number of years');
+        return;
+    }
+    
+    const infinityMode = years === 0;
+    
+    // Calculate costs based on mode
+    let totalCost: bigint;
+    let modeDescription: string;
+    
+    const n = selectedDomains.length;
+    if (infinityMode) {
+        totalCost = calcCronInfinityModeBalance(n) + CRON_INIT_FEE;
+        modeDescription = "Infinity mode - self-funding from wallet balance";
+        console.log(`\n♾️  Mode: ${modeDescription}`);
+        console.log(`💰 Initial cost: ${fromNano(totalCost)} TON`);
+        console.log('💡 This contract will renew domains as long as your wallet has balance');
+        console.log('💡 Each renewal cycle will cost approximately:');
+        console.log(`   - ${fromNano(calcCronInfinityModeBalance(n))} TON (contract fees)`);
+        console.log(`   - ${fromNano(calcRenewMsgsAmount(n))} TON (domain renewal fees)`);
+        console.log(`   - other fees`);
+        console.log(`So in total: ~${fromNano(calcCronInfinityModeBalance(n) + calcRenewMsgsAmount(n) + calcW5ComputeFee(n) + calcFwdFees(n))} TON per year`);
+    } else {
+        totalCost = calcCronCostPerYEAR(n) * BigInt(years) + CRON_INIT_FEE;
+        modeDescription = `Classic mode - ${years} year(s) prepaid`;
+        console.log(`\n✅ Mode: ${modeDescription}`);
+        console.log(`💰 Total cost: ${fromNano(totalCost)} TON for ${years} year(s)`);
+    }
     
     const confirm = await question('\n❓ Proceed with deployment? (y/N): ');
     if (confirm.toLowerCase() !== 'y' && confirm.toLowerCase() !== 'yes') {
@@ -1329,7 +1530,7 @@ async function createAutoRenewal(): Promise<void> {
     }
     
     try {
-        await deployAutoRenewal(selectedDomains);
+        await deployAutoRenewalWithParams(selectedDomains, undefined, undefined, undefined, undefined, years, infinityMode);
         console.log('✅ Auto-renewal deployed successfully!');
         
         // Refresh data
@@ -1583,7 +1784,8 @@ async function changeDomainList(selectedContract: CronContract): Promise<void> {
             salt,
             nextCallTime,
             selectedContract.repeatEvery,
-            newContractCost
+            newContractCost,
+            selectedContract.infinityMode
         );
         
         console.log('✅ Contract updated successfully!');
@@ -1599,6 +1801,20 @@ async function changeDomainList(selectedContract: CronContract): Promise<void> {
 async function topUpContract(selectedContract: CronContract): Promise<void> {
     console.log('\n💰 Top Up Contract');
     console.log('='.repeat(20));
+    
+    if (selectedContract.infinityMode) {
+        console.log('♾️  This is an Infinity mode contract');
+        console.log('💡 Infinity mode contracts are funded from your wallet balance automatically');
+        console.log('💡 No manual top-up is needed - just keep TON in your wallet');
+        console.log('');
+        console.log('📊 Current status:');
+        const oneCycleCost = calcCronInfinityModeBalance(selectedContract.domainsCount);
+        const canRunCycles = selectedContract.balance >= oneCycleCost ? Math.floor(Number(selectedContract.balance) / Number(oneCycleCost)) : 0;
+        console.log(`   Contract balance: ${fromNano(selectedContract.balance)} TON`);
+        console.log(`   One cycle cost: ${fromNano(oneCycleCost)} TON`);
+        console.log(`   Can run: ${canRunCycles} cycles with current balance`);
+        return;
+    }
     
     const yearsInput = await question('📅 Enter number of years to add: ');
     const years = parseInt(yearsInput.trim());
