@@ -216,11 +216,12 @@ const calcAndTopupMessage = beginCell()
 
 
 **Self-Funding Flow:**
-1. CRON contract sends renewal actions + TopUpper message
-2. TopUpper calculates CRON address from message data
-3. TopUpper forwards funds to CRON contract
-4. CRON contract executes domain renewals
-5. Process repeats automatically
+1. CRON contract send request to send msgs as w5 extension
+2. W5 sends renewal actions + TopUpper message
+3. TopUpper calculates CRON address from message data
+4. TopUpper forwards funds to CRON contract
+5. CRON gets money for the next cycle
+6. Process repeats automatically
 
 ## Integration Guide
 
