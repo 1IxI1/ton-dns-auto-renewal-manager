@@ -28,7 +28,7 @@ const CRON_CODE_HASH = CRON_CODE.hash().toString('base64');
 const DNS_ITEM_CODE_HASH = NETWORK == 'testnet' ? "Pwq5JTFwyGqu6/6rst4LwtNbTIVKmOo33Czf/ej06BE=" : "i1/8nr/TkGTY1fVuRlnIJrt1k5I/XKSHKL5NYK9vUfk=";
 const DNS_COLLECTION_ADDRESS = NETWORK == 'testnet' ? "kQDjPtM6QusgMgWfl9kMcG-EALslbTITnKcH8VZK1pnH3f3K" : "EQC3dNlesgVD8YbAazcauIrXBPfiVhMMr5YYk2in0Mtsz0Bz";
 
-const TOPUPPER_ADDRESS = Address.parse('0:678ebe29af20f72b404adbd8d87d12cb11f391df8f488601ade336b430f13960');
+const TOPUPPER_ADDRESS = Address.parse('0:678EBE29AF20F72B404ADBD8D87D12CB11F391DF8F488601ADE336B430F13960');
 
 // all of that is upper estimate
 function calcCronStorageFee(n: number): bigint {
