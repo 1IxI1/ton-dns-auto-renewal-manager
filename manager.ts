@@ -1307,7 +1307,7 @@ async function showMainMenu(): Promise<void> {
     console.log('2. 🤖 View auto-renewal contracts');
     console.log('3. ➕ Create new auto-renewal');
     console.log('4. ✏️  Edit auto-renewal');
-    console.log('5. 🗑️  Delete auto-renewal');
+    console.log('5. 🗑️  Delete auto-renewal (batch)');
     console.log('6. 🔄 Refresh data');
     console.log('7. 🚪 Exit');
     console.log('='.repeat(50));
@@ -1451,32 +1451,7 @@ async function createAutoRenewal(): Promise<void> {
         
     const input = await question('\n🎯 Enter domain numbers (e.g., 1,3,5 or 1-5,7,10): ');
         
-        const selectedIndices: number[] = [];
-        
-    // Parse ranges and individual numbers (reuse existing logic)
-        for (const part of input.split(',')) {
-            const trimmed = part.trim();
-            
-            if (trimmed.includes('-')) {
-                const [start, end] = trimmed.split('-').map(s => parseInt(s.trim()));
-                if (!isNaN(start) && !isNaN(end) && start <= end) {
-                    for (let i = start; i <= end; i++) {
-                        const index = i - 1;
-                    if (index >= 0 && index < appState.domains.length && !selectedIndices.includes(index)) {
-                            selectedIndices.push(index);
-                        }
-                    }
-                }
-            } else {
-                const num = parseInt(trimmed);
-                if (!isNaN(num)) {
-                    const index = num - 1;
-                if (index >= 0 && index < appState.domains.length && !selectedIndices.includes(index)) {
-                        selectedIndices.push(index);
-                    }
-                }
-            }
-        }
+    const selectedIndices = parseIndexRanges(input, appState.domains.length);
         
         if (selectedIndices.length === 0) {
         console.log('❌ No valid domains selected');
@@ -1699,32 +1674,7 @@ async function changeDomainList(selectedContract: CronContract): Promise<void> {
     
     const input = await question('\n🎯 Enter new domain numbers (e.g., 1,3,5 or 1-5,7,10): ');
     
-    const selectedIndices: number[] = [];
-    
-    // Parse ranges and individual numbers (reuse existing logic)
-    for (const part of input.split(',')) {
-        const trimmed = part.trim();
-        
-        if (trimmed.includes('-')) {
-            const [start, end] = trimmed.split('-').map(s => parseInt(s.trim()));
-            if (!isNaN(start) && !isNaN(end) && start <= end) {
-                for (let i = start; i <= end; i++) {
-                    const index = i - 1;
-                    if (index >= 0 && index < appState.domains.length && !selectedIndices.includes(index)) {
-                        selectedIndices.push(index);
-                    }
-                }
-            }
-        } else {
-            const num = parseInt(trimmed);
-            if (!isNaN(num)) {
-                const index = num - 1;
-                if (index >= 0 && index < appState.domains.length && !selectedIndices.includes(index)) {
-                    selectedIndices.push(index);
-                }
-            }
-        }
-    }
+    const selectedIndices = parseIndexRanges(input, appState.domains.length);
     
     if (selectedIndices.length === 0) {
         console.log('❌ No valid domains selected');
@@ -1870,10 +1820,191 @@ async function deleteContract(selectedContract: CronContract): Promise<void> {
     }
 }
 
+// Helper function to parse index ranges
+function parseIndexRanges(input: string, maxLength: number): number[] {
+    const selectedIndices: number[] = [];
+    
+    for (const part of input.split(',')) {
+        const trimmed = part.trim();
+        
+        if (trimmed.includes('-')) {
+            const [start, end] = trimmed.split('-').map(s => parseInt(s.trim()));
+            if (!isNaN(start) && !isNaN(end) && start <= end) {
+                for (let i = start; i <= end; i++) {
+                    const index = i - 1;
+                    if (index >= 0 && index < maxLength && !selectedIndices.includes(index)) {
+                        selectedIndices.push(index);
+                    }
+                }
+            }
+        } else {
+            const num = parseInt(trimmed);
+            if (!isNaN(num)) {
+                const index = num - 1;
+                if (index >= 0 && index < maxLength && !selectedIndices.includes(index)) {
+                    selectedIndices.push(index);
+                }
+            }
+        }
+    }
+    
+    return selectedIndices;
+}
+
+// Batch destroy multiple CRON contracts
+async function batchDestroyCronContracts(cronContracts: CronContract[]): Promise<void> {
+    if (!appState) throw new Error('App not initialized');
+    if (cronContracts.length === 0) return;
+    
+    console.log(`\n🗑️  Destroying ${cronContracts.length} CRON contracts...`);
+    
+    const {seqno} = await getWalletState(appState.wallet.address);
+    
+    // create actions for each contract
+    const walletActions: OutAction[] = [];
+    const extendedActions: (ExtensionAdd | ExtensionRemove)[] = [];
+    
+    for (const cron of cronContracts) {
+        console.log(`   📍 ${cron.address.toString()} (${cron.domainsCount} domains)`);
+        walletActions.push(createDestroyAction(cron.address));
+        extendedActions.push(createRemoveExtensionAction(cron.address));
+    }
+    
+    const validUntil = Math.floor(Date.now() / 1000) + 3600;
+    
+    const unsignedMessage = createRequestMessage(
+        false,
+        appState.walletId,
+        validUntil,
+        seqno,
+        { 
+            wallet: walletActions,
+            extended: extendedActions
+        }
+    );
+    
+    const signature = sign(unsignedMessage.hash(), appState.keyPair.secretKey);
+    
+    const signedMessage = beginCell()
+        .storeSlice(unsignedMessage.asSlice())
+        .storeBuffer(signature)
+        .endCell();
+    
+    const externalMessage = external({
+        to: appState.wallet.address,
+        body: signedMessage
+    });
+    
+    const externalMessageCell = beginCell()
+        .store(storeMessage(externalMessage))
+        .endCell();
+    
+    const finalBocBase64 = externalMessageCell.toBoc().toString('base64');
+    
+    console.log('🚀 Sending batch destroy message...');
+    const { response, result } = await sendBocToNetwork(finalBocBase64);
+    
+    if (result.ok) {
+        console.log('✅ Batch destroy message sent successfully!');
+        if (result.result?.hash) {
+            console.log(`   Transaction hash: ${result.result.hash}`);
+        }
+        console.log(`   Destroyed ${cronContracts.length} contracts`);
+    } else {
+        console.log('❌ Batch destroy failed!');
+        console.log(`   Error: ${result.error || 'Unknown error'}`);
+        throw new Error(`Batch destroy failed: ${result.error}`);
+    }
+}
+
 async function deleteAutoRenewal(): Promise<void> {
-    console.log('\n🗑️  Delete Auto-Renewal');
+    if (!appState) return;
+    
+    console.log('\n🗑️  Delete Auto-Renewal Contracts');
     console.log('='.repeat(50));
-    console.log('💡 Use option 4 (Edit auto-renewal) to delete specific contracts');
+    
+    // Refresh CRON contracts
+    appState.cronContracts = await getCronContracts(appState.wallet.address);
+    
+    if (appState.cronContracts.length === 0) {
+        console.log('❌ No auto-renewal contracts found');
+        return;
+    }
+    
+    // Sort by creation time (newest first) to match display order
+    appState.cronContracts.sort((a, b) => b.createdAt - a.createdAt);
+    
+    // Show available contracts
+    console.log('📋 Available auto-renewal contracts:');
+    appState.cronContracts.forEach((cron, index) => {
+        const nextCall = new Date(cron.nextCallTime * 1000);
+        const createdAt = new Date(cron.createdAt * 1000);
+        
+        // Calculate status based on mode
+        let status = '';
+        if (cron.infinityMode) {
+            const oneCycleCost = calcCronInfinityModeBalance(cron.domainsCount);
+            const isActive = cron.balance >= oneCycleCost;
+            status = isActive ? '♾️  Active (Infinity)' : '❌ Broken (Infinity)';
+        } else {
+            const yearCost = calcCronCostPerYEAR(cron.domainsCount);
+            const remainingYears = yearCost > 0 ? Math.floor(Number(cron.balance) / Number(yearCost)) : 0;
+            const isActive = remainingYears > 0;
+            status = isActive ? '✅ Active (Classic)' : '❌ Exhausted';
+        }
+        
+        const mode = cron.infinityMode ? 'Infinity' : 'Classic';
+        
+        console.log(`   ${index + 1}. ${status}`);
+        console.log(`      Address: ${cron.address.toString()}`);
+        console.log(`      Created: ${createdAt.toLocaleString()}`);
+        console.log(`      Mode: ${mode}`);
+        console.log(`      Balance: ${fromNano(cron.balance)} TON`);
+        console.log(`      Domains: ~${cron.domainsCount} domains`);
+        console.log(`      Next execution: ${nextCall.toLocaleString()}`);
+        console.log('');
+    });
+    
+    const input = await question('\n🎯 Enter contract numbers to delete (e.g., 1,3,5 or 2-4,6): ');
+    
+    const selectedIndices = parseIndexRanges(input, appState.cronContracts.length);
+    
+    if (selectedIndices.length === 0) {
+        console.log('❌ No valid contracts selected');
+        return;
+    }
+    
+    const selectedContracts = selectedIndices.map(i => appState!.cronContracts[i]);
+    
+    console.log(`\n📋 Selected ${selectedContracts.length} contracts to delete:`);
+    selectedContracts.forEach((cron, index) => {
+        const mode = cron.infinityMode ? 'Infinity' : 'Classic';
+        console.log(`   ${index + 1}. ${cron.address.toString()} (${mode}, ${cron.domainsCount} domains)`);
+    });
+    
+    // Calculate total balance to be returned
+    const totalBalance = selectedContracts.reduce((sum, cron) => sum + cron.balance, BigInt(0));
+    console.log(`\n💰 Total balance to be returned: ${fromNano(totalBalance)} TON`);
+    
+    console.log('\n⚠️  WARNING: This will permanently delete the selected auto-renewal contracts!');
+    console.log('⚠️  All remaining funds will be returned to your wallet.');
+    
+    const confirm = await question('\n❓ Are you sure you want to delete these contracts? (y/N): ');
+    if (confirm.toLowerCase() !== 'y' && confirm.toLowerCase() !== 'yes') {
+        console.log('❌ Deletion cancelled');
+        return;
+    }
+    
+    try {
+        await batchDestroyCronContracts(selectedContracts);
+        console.log('✅ Contracts deleted successfully!');
+        
+        // Refresh data
+        console.log('🔄 Refreshing data...');
+        await refreshData();
+    } catch (error) {
+        console.error('❌ Failed to delete contracts:', error);
+    }
 }
 
 async function deployAutoRenewal(selectedDomains: Domain[], deployAmount?: bigint): Promise<void> {
