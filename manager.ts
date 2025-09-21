@@ -774,7 +774,7 @@ async function getCronContracts(walletAddress: Address): Promise<CronContract[]>
                     // Parse the message to count domains
                     const domains = parseDomainsFromCronMessage(cronData.message);
                     // Check if it's infinity mode by looking for self-funding message
-                    const infinityMode = checkInfinityModeFromCronMessage(cronData.message, address);
+                    const infinityMode = checkInfinityModeFromCronMessage(cronData.message);
                     
                     cronContracts.push({
                         address,
@@ -865,7 +865,7 @@ function parseDomainsFromCronMessage(message: Cell): Address[] {
     }
 }
 
-function checkInfinityModeFromCronMessage(message: Cell, cronAddress: Address): boolean {
+function checkInfinityModeFromCronMessage(message: Cell): boolean {
     try {
         let foundTopUpperMessage = false;
         let i = 0;
